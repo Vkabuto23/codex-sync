@@ -103,7 +103,35 @@ $codex-sync sync this chat
 
 Sync replaces the compact checkpoint, merges durable context and links, copies explicitly selected small artifacts, then commits and pushes only when something changed.
 
-Only the canonical source may write: the current project and chat names must match the saved project's and chat's normalized names. A chat linked from another project is a restore-only consumer and can never overwrite the source.
+Before writing, the CLI obtains the exact user-facing chat title from Codex App Server `thread/read` using `CODEX_THREAD_ID`. The State Repository directory uses that exact `thread.name`. The model is not allowed to summarize, translate, infer, or reuse an older title.
+
+For example, if the sidebar title is:
+
+```text
+GZapp main chat
+```
+
+then the only valid destination is:
+
+```text
+projects/GZapp/GZapp main chat/
+```
+
+`Search and testing 5.5`, `GZapp search`, or any other model-generated alternative is rejected before bootstrap, file writes, commit, or push.
+
+Only the canonical source may write: the current project name and exact current chat title must equal the saved source. A chat linked from another project is a restore-only consumer and can never overwrite it.
+
+### Exact titles and Cyrillic
+
+Git and GitHub support Unicode paths, so Cyrillic titles are kept directly:
+
+```text
+projects/GZapp/Поиск и обработка/
+```
+
+The CLI preserves titles as Unicode NFC and never transliterates them. A title containing Windows-forbidden filename characters (`< > : " / \\ | ? *`), a reserved Windows device name, leading/trailing whitespace, or more than 100 characters cannot be represented portably across Windows and macOS. In that case sync stops and asks the user to rename the Codex chat; characters are never silently replaced.
+
+If the current host cannot retrieve `thread.name`, sync also stops. The only fallback is to ask the user to copy the exact visible title and then use the explicit `--user-confirmed-title` path. The model must not invent a fallback.
 
 ### Restore is read
 
@@ -127,7 +155,7 @@ The role is derived, not chosen:
 
 | Current location | Role | Restore | Sync |
 | --- | --- | --- | --- |
-| Same normalized project and chat as the saved source | `source` | Yes | Yes |
+| Same project and exact chat title as the saved source | `source` | Yes | Yes |
 | Any different project or chat | `consumer` | Yes | **No** |
 
 This is the central safety rule. Five computers can all write when each has the same canonical project/chat and each thread is linked as a source. Ten chats in other projects can consume the same context, but all ten remain restore-only.
@@ -151,7 +179,7 @@ The presence of `linked-chats.md` enables strict mode. Then:
 - an unlinked thread is refused and must run link first;
 - a consumer is refused for sync even though it is linked.
 
-If a Codex host does not expose a reliable `CODEX_THREAD_ID`, ordinary open-mode sync and restore still work. Linking and access to strict chats are reported as unavailable; they are never simulated.
+If a Codex host does not expose a reliable `CODEX_THREAD_ID`, restore still works and open-mode sync remains available only after the user explicitly copies and confirms the exact visible title. Linking and access to strict chats are reported as unavailable; they are never simulated.
 
 ## Typical Windows → Mac workflow
 
@@ -192,6 +220,7 @@ Most users should let Codex operate the bundled CLI. For troubleshooting:
 
 ```shell
 python scripts/codex_sync.py doctor
+python scripts/codex_sync.py current-title
 python scripts/codex_sync.py bootstrap
 python scripts/codex_sync.py list
 ```

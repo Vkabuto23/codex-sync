@@ -7,19 +7,21 @@ import argparse
 import json
 import os
 import platform
+import queue
 import re
 import shutil
 import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import unicodedata
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Iterable, Sequence
 
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 MAX_ARTIFACT_BYTES = 10 * 1024 * 1024
 INVALID_PATH_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 RESERVED_WINDOWS_NAMES = {
@@ -152,6 +154,7 @@ def default_state_path(repository_name: str) -> Path:
 def check_dependencies() -> dict[str, str]:
     git_path = require_program("git", "Install Git 2.30 or newer.")
     gh_path = require_program("gh", "Install GitHub CLI from https://cli.github.com/.")
+    codex_path = shutil.which("codex")
     username = github_username()
     git_version = run([git_path, "--version"]).stdout.strip()
     gh_version = run([gh_path, "--version"]).stdout.splitlines()[0].strip()
@@ -159,6 +162,7 @@ def check_dependencies() -> dict[str, str]:
         "git": git_version,
         "gh": gh_version,
         "github_username": username,
+        "exact_title_resolution_available": str(bool(codex_path and os.environ.get("CODEX_THREAD_ID"))).lower(),
         "thread_id_available": str(bool(os.environ.get("CODEX_THREAD_ID"))).lower(),
         "python": platform.python_version(),
     }
@@ -305,8 +309,26 @@ def normalized(value: str) -> str:
     return " ".join(re.findall(r"[^\W_]+", value, flags=re.UNICODE))
 
 
+def exact_chat_name(value: str) -> str:
+    """Return a portable chat title without silently changing its visible spelling."""
+    if not isinstance(value, str) or not value:
+        raise SyncError("Chat title is empty. Rename the Codex chat before syncing.")
+    if value != value.strip():
+        raise SyncError("Chat title has leading or trailing whitespace. Rename it before syncing.")
+    value = unicodedata.normalize("NFC", value)
+    if value in {".", ".."} or INVALID_PATH_CHARS.search(value) or value.endswith((" ", ".")):
+        raise SyncError(
+            "The exact Codex chat title is not portable as a Windows/macOS directory name. Rename the chat without < > : \" / \\ | ? * or trailing dots/spaces, then retry."
+        )
+    if value.split(".", 1)[0].upper() in RESERVED_WINDOWS_NAMES:
+        raise SyncError("The exact Codex chat title is a reserved Windows filename. Rename the chat, then retry.")
+    if len(value) > 100:
+        raise SyncError("The exact Codex chat title is longer than 100 characters. Shorten it before syncing.")
+    return value
+
+
 def canonical_names(project: str, chat: str) -> tuple[str, str]:
-    return safe_name(project, "project"), safe_name(chat, "chat")
+    return safe_name(project, "project"), exact_chat_name(chat)
 
 
 def chat_path(repo: Path, project: str, chat: str) -> Path:
@@ -368,9 +390,150 @@ def get_thread_id(explicit: str | None, *, required: bool) -> str | None:
     return thread_id
 
 
+def app_server_thread_title(thread_id: str, timeout_seconds: float = 10.0) -> str:
+    """Read the user-facing title through the documented Codex app-server API."""
+    codex = require_program(
+        "codex",
+        "The Codex executable is required to verify the exact current chat title. Ask the user for the title explicitly only as a fallback.",
+    )
+    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+    process = subprocess.Popen(
+        [codex, "app-server", "--stdio"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        bufsize=1,
+        creationflags=creationflags,
+    )
+    if process.stdin is None or process.stdout is None or process.stderr is None:
+        process.kill()
+        raise SyncError("Could not open the Codex app-server stdio transport.")
+
+    messages: queue.Queue[str | None] = queue.Queue()
+    errors: list[str] = []
+
+    def pump_stdout() -> None:
+        try:
+            for line in process.stdout:
+                messages.put(line)
+        finally:
+            messages.put(None)
+
+    def pump_stderr() -> None:
+        for line in process.stderr:
+            if len(errors) < 20:
+                errors.append(line.strip())
+
+    stdout_thread = threading.Thread(target=pump_stdout, daemon=True)
+    stderr_thread = threading.Thread(target=pump_stderr, daemon=True)
+    stdout_thread.start()
+    stderr_thread.start()
+
+    def send(payload: dict[str, object]) -> None:
+        process.stdin.write(json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n")
+        process.stdin.flush()
+
+    def wait_for(request_id: int) -> dict[str, object]:
+        while True:
+            try:
+                line = messages.get(timeout=timeout_seconds)
+            except queue.Empty as exc:
+                raise SyncError("Timed out while reading the current chat title from Codex app-server.") from exc
+            if line is None:
+                detail = redact(" ".join(errors))[:500]
+                raise SyncError(f"Codex app-server closed before returning the current chat title. {detail}".strip())
+            try:
+                payload = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if payload.get("id") != request_id:
+                continue
+            if payload.get("error"):
+                raise SyncError(f"Codex app-server rejected thread/read: {payload['error']}")
+            result = payload.get("result")
+            if not isinstance(result, dict):
+                raise SyncError("Codex app-server returned a malformed response.")
+            return result
+
+    try:
+        send(
+            {
+                "method": "initialize",
+                "id": 0,
+                "params": {
+                    "clientInfo": {
+                        "name": "codex_sync",
+                        "title": "Codex Sync",
+                        "version": VERSION,
+                    }
+                },
+            }
+        )
+        wait_for(0)
+        send({"method": "initialized", "params": {}})
+        send(
+            {
+                "method": "thread/read",
+                "id": 1,
+                "params": {"threadId": thread_id, "includeTurns": False},
+            }
+        )
+        result = wait_for(1)
+        thread = result.get("thread")
+        if not isinstance(thread, dict):
+            raise SyncError("Codex app-server did not return the requested thread.")
+        title = thread.get("name")
+        if not isinstance(title, str) or not title.strip():
+            raise SyncError(
+                "The current Codex thread has no user-facing title yet. Rename the chat or provide its exact title after explicit confirmation."
+            )
+        return exact_chat_name(title)
+    finally:
+        try:
+            process.stdin.close()
+        except OSError:
+            pass
+        try:
+            process.terminate()
+            process.wait(timeout=2)
+        except (OSError, subprocess.TimeoutExpired):
+            process.kill()
+
+
+def resolve_current_chat_title(
+    provided: str | None,
+    *,
+    thread_id: str | None,
+    user_confirmed: bool,
+) -> tuple[str, str]:
+    """Resolve an exact title and reject model-invented or stale alternatives."""
+    if thread_id:
+        try:
+            title = app_server_thread_title(thread_id)
+        except SyncError as exc:
+            if not user_confirmed:
+                raise SyncError(
+                    f"Could not verify the exact current Codex chat title: {exc} Ask the user to copy the exact visible title, then retry with --user-confirmed-title."
+                ) from exc
+        else:
+            if provided is not None and exact_chat_name(provided) != title:
+                raise SyncError(
+                    f"Chat title mismatch: Codex reports '{title}', but the requested sync/link used '{provided}'. Nothing was written."
+                )
+            return title, "codex-app-server"
+    if user_confirmed and provided:
+        return exact_chat_name(provided), "user-confirmed"
+    raise SyncError(
+        "Exact current chat title is unavailable. Ask the user to copy the title exactly and retry with --current-chat plus --user-confirmed-title. Never infer a title."
+    )
+
+
 def computed_role(current_project: str, current_chat: str, source_project: str, source_chat: str) -> str:
     current_project_name, current_chat_name = canonical_names(current_project, current_chat)
-    if normalized(current_project_name) == normalized(source_project) and normalized(current_chat_name) == normalized(source_chat):
+    if current_project_name == source_project and current_chat_name == source_chat:
         return "source"
     return "consumer"
 
@@ -539,6 +702,20 @@ def cmd_doctor(_args: argparse.Namespace) -> None:
     emit(details)
 
 
+def cmd_current_title(args: argparse.Namespace) -> None:
+    thread_id = get_thread_id(args.thread_id, required=True)
+    title = app_server_thread_title(thread_id)
+    emit(
+        {
+            "ok": True,
+            "thread": thread_id,
+            "title": title,
+            "source": "codex-app-server",
+            "exact": True,
+        }
+    )
+
+
 def cmd_bootstrap(_args: argparse.Namespace) -> None:
     ctx = ensure_repository()
     emit({"ok": True, "repository": ctx.full_name, "private": True, "url": ctx.url, "local_path": str(ctx.path)})
@@ -596,9 +773,15 @@ def cmd_inspect(args: argparse.Namespace) -> None:
 
 
 def cmd_write(args: argparse.Namespace) -> None:
+    thread_id = get_thread_id(args.thread_id, required=not args.user_confirmed_title)
+    current_chat, title_source = resolve_current_chat_title(
+        args.current_chat,
+        thread_id=thread_id,
+        user_confirmed=args.user_confirmed_title,
+    )
     ctx = ensure_repository()
     source_project, source_chat = canonical_names(args.project, args.chat)
-    assert_canonical_writer(args.current_project, args.current_chat, source_project, source_chat)
+    assert_canonical_writer(args.current_project, current_chat, source_project, source_chat)
     staged = [Path(args.sync_file).resolve(), Path(args.context_file).resolve(), Path(args.links_file).resolve()]
     validate_state_inputs(staged)
     artifacts = [Path(item).resolve() for item in args.artifact]
@@ -607,15 +790,14 @@ def cmd_write(args: argparse.Namespace) -> None:
 
     target = chat_path(ctx.path, source_project, source_chat)
     linked_path = target / "linked-chats.md"
-    thread_id: str | None = None
     link_changed = False
     if linked_path.exists():
-        thread_id = get_thread_id(args.thread_id, required=True)
+        thread_id = get_thread_id(thread_id, required=True)
         authorize_strict(linked_path, thread_id, write=True)
     elif args.enable_linking:
-        thread_id = get_thread_id(args.thread_id, required=True)
-        current_project, current_chat = canonical_names(args.current_project, args.current_chat)
-        record = LinkRecord(thread_id, "source", current_project, current_chat, socket.gethostname())
+        thread_id = get_thread_id(thread_id, required=True)
+        current_project, exact_current_chat = canonical_names(args.current_project, current_chat)
+        record = LinkRecord(thread_id, "source", current_project, exact_current_chat, socket.gethostname())
         write_link_records(linked_path, [record])
         link_changed = True
 
@@ -639,6 +821,8 @@ def cmd_write(args: argparse.Namespace) -> None:
         {
             "ok": True,
             "repository": ctx.full_name,
+            "current_chat": current_chat,
+            "title_source": title_source,
             "saved_path": relative_posix(target, ctx.path),
             "strict_linking": linked_path.exists(),
             "link_initialized": link_changed,
@@ -686,13 +870,18 @@ def cmd_restore(args: argparse.Namespace) -> None:
 
 
 def cmd_link(args: argparse.Namespace) -> None:
+    thread_id = get_thread_id(args.thread_id, required=True)
+    current_chat_title, title_source = resolve_current_chat_title(
+        args.current_chat,
+        thread_id=thread_id,
+        user_confirmed=args.user_confirmed_title,
+    )
     ctx = ensure_repository()
     source_project, source_chat = canonical_names(args.project, args.chat)
     target = chat_path(ctx.path, source_project, source_chat)
     if not (target / "sync.md").is_file():
         raise SyncError(f"Cannot link a missing saved chat: {source_project} / {source_chat}")
-    thread_id = get_thread_id(args.thread_id, required=True)
-    current_project, current_chat = canonical_names(args.current_project, args.current_chat)
+    current_project, current_chat = canonical_names(args.current_project, current_chat_title)
     role = computed_role(current_project, current_chat, source_project, source_chat)
     record = LinkRecord(thread_id, role, current_project, current_chat, socket.gethostname())
     local_marker: Path | None = None
@@ -718,6 +907,8 @@ def cmd_link(args: argparse.Namespace) -> None:
             "project": source_project,
             "chat": source_chat,
             "thread": thread_id,
+            "current_chat": current_chat,
+            "title_source": title_source,
             "role": role,
             "permissions": ["restore", "sync"] if role == "source" else ["restore"],
             "local_marker": str(local_marker) if local_marker else None,
@@ -737,6 +928,10 @@ def build_parser() -> argparse.ArgumentParser:
     doctor = subparsers.add_parser("doctor", help="Check Git, GitHub CLI, authentication, and thread-ID availability")
     doctor.set_defaults(func=cmd_doctor)
 
+    current_title = subparsers.add_parser("current-title", help="Read the exact current Codex chat title through thread/read")
+    current_title.add_argument("--thread-id", help=argparse.SUPPRESS)
+    current_title.set_defaults(func=cmd_current_title)
+
     bootstrap = subparsers.add_parser("bootstrap", help="Create/verify the private state repository and stable local clone")
     bootstrap.set_defaults(func=cmd_bootstrap)
 
@@ -753,7 +948,12 @@ def build_parser() -> argparse.ArgumentParser:
     write.add_argument("--project", required=True, help="Canonical source project")
     write.add_argument("--chat", required=True, help="Canonical source chat")
     write.add_argument("--current-project", required=True)
-    write.add_argument("--current-chat", required=True)
+    write.add_argument("--current-chat", help="Optional expected title; must exactly match the Codex-reported title")
+    write.add_argument(
+        "--user-confirmed-title",
+        action="store_true",
+        help="Use --current-chat only when the user explicitly copied/confirmed it and app-server title lookup is unavailable",
+    )
     write.add_argument("--sync-file", required=True)
     write.add_argument("--context-file", required=True)
     write.add_argument("--links-file", required=True)
@@ -775,7 +975,12 @@ def build_parser() -> argparse.ArgumentParser:
     link.add_argument("--project", required=True, help="Canonical source project")
     link.add_argument("--chat", required=True, help="Canonical source chat")
     link.add_argument("--current-project", required=True)
-    link.add_argument("--current-chat", required=True)
+    link.add_argument("--current-chat", help="Optional expected title; must exactly match the Codex-reported title")
+    link.add_argument(
+        "--user-confirmed-title",
+        action="store_true",
+        help="Use --current-chat only when the user explicitly copied/confirmed it and app-server title lookup is unavailable",
+    )
     link.add_argument("--project-root")
     link.add_argument("--replace-marker", action="store_true")
     link.add_argument("--thread-id", help=argparse.SUPPRESS)

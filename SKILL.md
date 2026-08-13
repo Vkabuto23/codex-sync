@@ -18,7 +18,7 @@ Transfer the useful working state of a logical chat, not Codex's internal sessio
 
 Identify a saved chat by its human-readable `project name + chat name`.
 
-- A canonical source has the same normalized project and chat names as the saved chat. Only a canonical source may write with `sync`.
+- A canonical source has the same project name and the exact same user-facing chat title as the saved chat. Only a canonical source may write with `sync`.
 - A same-name linked thread receives role `source` and may sync and restore.
 - A linked thread whose project or chat differs receives role `consumer` and may restore only. Never allow it to sync, even if it has a valid thread ID.
 - When `linked-chats.md` is absent, use open mode: canonical sources may sync and restore is allowed without a thread ID.
@@ -26,7 +26,7 @@ Identify a saved chat by its human-readable `project name + chat name`.
 - Allow `link` to add the current thread explicitly. Derive its role from the names; never accept a caller-supplied role.
 - Create `<current-project-root>/.codex-sync/linked-with.md` for every consumer link. Use this local marker to resolve later restores. Never create it for a canonical source.
 
-Do not weaken these rules based on semantic similarity. Semantic matching selects a candidate; authorization uses normalized canonical names and linked roles.
+Do not weaken these rules based on semantic similarity. Use semantic matching only to select restore/link targets. Never use it to choose or invent a sync destination.
 
 ## Locate the CLI
 
@@ -43,36 +43,49 @@ The CLI requires `git` and an authenticated GitHub CLI session. It obtains the G
 
 Stop on missing dependencies, failed authentication, a public state repository, a dirty state clone, non-fast-forward conflicts, or secret-scan failures. Never force-push.
 
-## Determine project, chat, and thread
+## Determine project, exact chat title, and thread
 
-Use the natural project name already shown by Codex or the repository/directory name. Use the visible chat title when available; otherwise infer a concise task title. Never use a path, UUID, hash, or thread ID as the primary name.
+Use the natural project name already shown by Codex or the repository/directory name. Never infer, summarize, translate, shorten, or reuse an old name for the current chat.
 
-Obtain the current thread ID only from `CODEX_THREAD_ID`. Pass `--thread-id` only when a trusted host supplies an equivalent stable value. If no ID exists, keep open-mode sync/restore working and report that linking or strict-mode access is unavailable. Never inspect or modify Codex session storage to discover or replace an ID.
+Before every sync or link, resolve the exact user-facing title:
 
-List saved chats before choosing a target:
+```text
+python <skill>/scripts/codex_sync.py current-title
+```
+
+The CLI uses the documented read-only Codex App Server `thread/read` method with `CODEX_THREAD_ID` and returns `thread.name`. Copy the returned `title` byte-for-byte into `--chat` and optionally `--current-chat`. The `write` and `link` commands verify it again before any GitHub mutation and reject a mismatch.
+
+If App Server cannot return a title or returns `null`, stop. Ask the user to copy the exact visible chat title. Only after that explicit answer may you pass it with `--current-chat <exact-title> --user-confirmed-title`. Never generate a fallback title yourself.
+
+Preserve Cyrillic and other Unicode characters. Normalize only to Unicode NFC for cross-platform consistency. Do not transliterate. If the exact title contains Windows-forbidden filename characters (`< > : " / \\ | ? *`), is a reserved filename, has leading/trailing whitespace, or exceeds 100 characters, ask the user to rename the chat; never silently replace characters.
+
+Obtain the current thread ID only from `CODEX_THREAD_ID`. Pass `--thread-id` only when a trusted host supplies an equivalent stable value. If no ID exists, keep restore working and allow open-mode sync only after the user explicitly supplies the exact title via `--user-confirmed-title`; report that linking or strict-mode access is unavailable. Never inspect or modify Codex session storage to discover or replace an ID.
+
+List saved chats before choosing a restore or link target:
 
 ```text
 python <skill>/scripts/codex_sync.py list [--project <name>]
 ```
 
-Match in this order: exact, normalized, then semantic comparison using names and `sync.md`. Prefer an obvious existing chat over creating a near-duplicate. Ask the user only when multiple candidates remain materially ambiguous. Pass the selected canonical names exactly as listed to the CLI.
+For restore/link, match in this order: exact, normalized, then semantic comparison using names and `sync.md`. Ask the user only when multiple candidates remain materially ambiguous. For sync, do not perform semantic matching: use only the exact title returned by `current-title`. If no directory with that exact title exists, create it as a new saved chat.
 
 ## Sync
 
-1. Run `inspect --project <canonical-project> --chat <canonical-chat>` to pull the latest state and learn paths/mode.
-2. Confirm that the current project and current chat normalize to the canonical names. Do not write from a consumer or differently named chat.
-3. Read any existing `sync.md`, `context.md`, and `links.md` needed to preserve durable knowledge.
-4. Create three UTF-8 Markdown staging files using the templates in `assets/templates/`:
+1. Run `current-title` and treat its exact `title` as both the current chat and canonical saved-chat name.
+2. Run `inspect --project <current-project> --chat <exact-title>` to pull the latest state and learn paths/mode. Never inspect or select a differently named chat for sync.
+3. Confirm that the current project and exact current title equal the canonical names. Do not write from a consumer or differently named chat.
+4. Read any existing `sync.md`, `context.md`, and `links.md` needed to preserve durable knowledge.
+5. Create three UTF-8 Markdown staging files using the templates in `assets/templates/`:
    - Replace `sync.md` with a compact current checkpoint: task, status, completed work, current work, next step, constraints, blockers.
    - Merge `context.md` as durable memory: decisions, reasons, requirements, rejected options worth retaining, important facts. Deduplicate and remove only clearly obsolete material.
    - Update `links.md` with meaningful repositories, directories, servers, APIs, documents, services, or environments. Record secret locations, never secret values.
-5. Select only small artifacts required to continue and unavailable elsewhere.
-6. Call `write` with both canonical and current names, the three staging files, and any artifacts. Add `--enable-linking` only when the user explicitly asks to enable strict linking on this first sync.
+6. Select only small artifacts required to continue and unavailable elsewhere.
+7. Call `write` with the exact title, the three staging files, and any artifacts. Add `--enable-linking` only when the user explicitly asks to enable strict linking on this first sync.
 
 ```text
 python <skill>/scripts/codex_sync.py write \
-  --project <canonical-project> --chat <canonical-chat> \
-  --current-project <current-project> --current-chat <current-chat> \
+  --project <current-project> --chat <exact-current-title> \
+  --current-project <current-project> --current-chat <exact-current-title> \
   --sync-file <staged-sync.md> --context-file <staged-context.md> \
   --links-file <staged-links.md> [--artifact <path> ...] [--enable-linking]
 ```
@@ -108,7 +121,7 @@ python <skill>/scripts/codex_sync.py link \
   --project-root <current-project-root>
 ```
 
-The CLI reads `CODEX_THREAD_ID`, computes `source` for normalized same-name project+chat and `consumer` otherwise, updates `linked-chats.md` without duplicates, commits and pushes it, and writes the local consumer marker. If an existing local marker points elsewhere, stop; use `--replace-marker` only after the user explicitly confirms reassignment.
+The CLI reads `CODEX_THREAD_ID` and the exact App Server title, computes `source` only for exactly matching project+chat names and `consumer` otherwise, updates `linked-chats.md` without duplicates, commits and pushes it, and writes the local consumer marker. If an existing local marker points elsewhere, stop; use `--replace-marker` only after the user explicitly confirms reassignment.
 
 After linking, run restore separately when the user requested both. Do not make link silently restore state.
 
@@ -128,7 +141,10 @@ Read [state-format.md](references/state-format.md) when authoring or interpretin
 
 - Missing `gh`: stop and ask the user to install GitHub CLI.
 - Unauthenticated `gh`: stop and ask the user to run `gh auth login`.
-- Missing `CODEX_THREAD_ID`: disable linking and strict-mode access only; preserve open-mode sync/restore.
+- Missing `CODEX_THREAD_ID`: disable linking and strict-mode access; preserve restore and allow open-mode sync only after explicit exact-title confirmation.
+- Missing or unverifiable current title: stop sync/link and ask the user to copy the exact visible title; never infer one.
+- App Server title differs from `--chat`/`--current-chat`: stop before bootstrap, file writes, commit, or push.
+- Non-portable exact title: ask the user to rename the chat instead of silently sanitizing it.
 - Consumer sync: refuse and explain that cross-project links are restore-only.
 - Unlinked strict restore/sync: refuse and direct the user to link first.
 - Git conflict or rejected safe rebase: stop without force-pushing or deleting either version.

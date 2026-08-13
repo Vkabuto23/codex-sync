@@ -15,7 +15,7 @@ projects/
         └── artifacts/        # optional contents
 ```
 
-Project and chat directory names are human-readable. Windows-invalid filename characters are replaced safely, trailing dots/spaces are removed, and reserved Windows device names receive a suffix. UUIDs and thread IDs never become the primary directory name.
+Project and chat directory names are human-readable. A chat directory must equal the exact user-facing Codex `thread.name`, preserved as Unicode NFC. Cyrillic and other Unicode scripts are stored without transliteration. Never infer or silently sanitize a chat title. If it contains Windows-invalid characters, trailing dots/spaces, a reserved device name, or exceeds 100 characters, require the user to rename the chat before sync. UUIDs and thread IDs never become the primary directory name.
 
 ## `sync.md`
 
@@ -67,7 +67,7 @@ The CLI owns this Markdown table:
 | 22222222-2222-2222-2222-222222222222 | consumer | reporting | Supplier dashboard | laptop |
 ```
 
-Presence enables strict mode. `source` is computed only when normalized project and chat names equal the canonical directory names. Every other link is `consumer` and restore-only.
+Presence enables strict mode. `source` is computed only when project name and exact chat title equal the canonical directory names. Every other link is `consumer` and restore-only.
 
 ## Local `linked-with.md`
 
