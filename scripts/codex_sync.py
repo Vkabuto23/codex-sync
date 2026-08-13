@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Iterable, Sequence
 
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 MAX_ARTIFACT_BYTES = 10 * 1024 * 1024
 INVALID_PATH_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 RESERVED_WINDOWS_NAMES = {
@@ -390,8 +390,13 @@ def get_thread_id(explicit: str | None, *, required: bool) -> str | None:
     return thread_id
 
 
-def app_server_thread_title(thread_id: str, timeout_seconds: float = 10.0) -> str:
-    """Read the user-facing title through the documented Codex app-server API."""
+def app_server_request(
+    method: str,
+    params: dict[str, object],
+    *,
+    timeout_seconds: float = 10.0,
+) -> dict[str, object]:
+    """Call one documented Codex app-server method over a short-lived stdio connection."""
     codex = require_program(
         "codex",
         "The Codex executable is required to verify the exact current chat title. Ask the user for the title explicitly only as a fallback.",
@@ -441,10 +446,10 @@ def app_server_thread_title(thread_id: str, timeout_seconds: float = 10.0) -> st
             try:
                 line = messages.get(timeout=timeout_seconds)
             except queue.Empty as exc:
-                raise SyncError("Timed out while reading the current chat title from Codex app-server.") from exc
+                raise SyncError(f"Timed out while waiting for Codex app-server method {method}.") from exc
             if line is None:
                 detail = redact(" ".join(errors))[:500]
-                raise SyncError(f"Codex app-server closed before returning the current chat title. {detail}".strip())
+                raise SyncError(f"Codex app-server closed before completing {method}. {detail}".strip())
             try:
                 payload = json.loads(line)
             except json.JSONDecodeError:
@@ -452,7 +457,7 @@ def app_server_thread_title(thread_id: str, timeout_seconds: float = 10.0) -> st
             if payload.get("id") != request_id:
                 continue
             if payload.get("error"):
-                raise SyncError(f"Codex app-server rejected thread/read: {payload['error']}")
+                raise SyncError(f"Codex app-server rejected {method}: {payload['error']}")
             result = payload.get("result")
             if not isinstance(result, dict):
                 raise SyncError("Codex app-server returned a malformed response.")
@@ -476,21 +481,12 @@ def app_server_thread_title(thread_id: str, timeout_seconds: float = 10.0) -> st
         send({"method": "initialized", "params": {}})
         send(
             {
-                "method": "thread/read",
+                "method": method,
                 "id": 1,
-                "params": {"threadId": thread_id, "includeTurns": False},
+                "params": params,
             }
         )
-        result = wait_for(1)
-        thread = result.get("thread")
-        if not isinstance(thread, dict):
-            raise SyncError("Codex app-server did not return the requested thread.")
-        title = thread.get("name")
-        if not isinstance(title, str) or not title.strip():
-            raise SyncError(
-                "The current Codex thread has no user-facing title yet. Rename the chat or provide its exact title after explicit confirmation."
-            )
-        return exact_chat_name(title)
+        return wait_for(1)
     finally:
         try:
             process.stdin.close()
@@ -501,6 +497,34 @@ def app_server_thread_title(thread_id: str, timeout_seconds: float = 10.0) -> st
             process.wait(timeout=2)
         except (OSError, subprocess.TimeoutExpired):
             process.kill()
+
+
+def app_server_thread_title(thread_id: str, timeout_seconds: float = 10.0) -> str:
+    """Read the user-facing title through the documented Codex app-server API."""
+    result = app_server_request(
+        "thread/read",
+        {"threadId": thread_id, "includeTurns": False},
+        timeout_seconds=timeout_seconds,
+    )
+    thread = result.get("thread")
+    if not isinstance(thread, dict):
+        raise SyncError("Codex app-server did not return the requested thread.")
+    title = thread.get("name")
+    if not isinstance(title, str) or not title.strip():
+        raise SyncError(
+            "The current Codex thread has no user-facing title yet. Rename the chat or provide its exact title after explicit confirmation."
+        )
+    return exact_chat_name(title)
+
+
+def app_server_set_thread_title(thread_id: str, title: str) -> str:
+    """Set and verify the user-facing title through documented app-server methods."""
+    wanted = exact_chat_name(title)
+    app_server_request("thread/name/set", {"threadId": thread_id, "name": wanted})
+    actual = app_server_thread_title(thread_id)
+    if actual != wanted:
+        raise SyncError(f"Codex reported '{actual}' after renaming the chat to '{wanted}'.")
+    return actual
 
 
 def resolve_current_chat_title(
@@ -626,6 +650,47 @@ def marker_path(project_root: str) -> Path:
     if not root.is_dir():
         raise SyncError(f"Current project root does not exist: {root}")
     return root / ".codex-sync" / "linked-with.md"
+
+
+def local_preferences_root() -> Path:
+    configured = os.environ.get("CODEX_SYNC_LOCAL_STATE_DIR")
+    if configured:
+        return Path(configured).expanduser().resolve()
+    if os.name == "nt":
+        base = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
+    else:
+        base = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local" / "state"))
+    return (base / "codex-sync" / "local").resolve()
+
+
+def title_sync_preference_path(thread_id: str) -> Path:
+    if not THREAD_RE.fullmatch(thread_id):
+        raise SyncError("The current Codex thread ID has an unexpected format.")
+    return local_preferences_root() / "title-sync" / f"{thread_id}.json"
+
+
+def title_sync_declined(thread_id: str) -> bool:
+    path = title_sync_preference_path(thread_id)
+    if not path.is_file():
+        return False
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    return payload.get("declined") is True
+
+
+def set_title_sync_declined(thread_id: str, declined: bool) -> Path | None:
+    path = title_sync_preference_path(thread_id)
+    if not declined:
+        if path.exists():
+            path.unlink()
+        return None
+    atomic_write(
+        path,
+        json.dumps({"thread": thread_id, "declined": True}, ensure_ascii=False, indent=2) + "\n",
+    )
+    return path
 
 
 def marker_values(path: Path) -> dict[str, str]:
@@ -845,11 +910,31 @@ def cmd_restore(args: argparse.Namespace) -> None:
     linked_path = target / "linked-chats.md"
     authorization = "open"
     role: str | None = None
+    thread_id = get_thread_id(args.thread_id, required=linked_path.exists() or args.empty_chat)
     if linked_path.exists():
-        thread_id = get_thread_id(args.thread_id, required=True)
+        assert thread_id is not None
         record = authorize_strict(linked_path, thread_id, write=False)
         authorization = "strict"
         role = record.role
+    if args.current_chat:
+        current_chat = exact_chat_name(args.current_chat)
+    elif args.empty_chat:
+        current_chat = source_chat
+    else:
+        raise SyncError("Provide --current-chat unless --empty-chat is used for a fresh restore-only chat.")
+    renamed = False
+    if args.empty_chat:
+        assert thread_id is not None
+        current_chat = app_server_set_thread_title(thread_id, source_chat)
+        set_title_sync_declined(thread_id, False)
+        renamed = True
+    elif thread_id:
+        try:
+            current_chat = app_server_thread_title(thread_id)
+        except SyncError:
+            # Restore remains read-only and usable when exact title lookup is temporarily unavailable.
+            pass
+    declined = title_sync_declined(thread_id) if thread_id else False
     emit(
         {
             "ok": True,
@@ -858,6 +943,13 @@ def cmd_restore(args: argparse.Namespace) -> None:
             "chat": source_chat,
             "authorization": authorization,
             "role": role,
+            "current_chat": current_chat,
+            "title_alignment": {
+                "matches": current_chat == source_chat,
+                "renamed_empty_chat": renamed,
+                "suggestion_declined_locally": declined,
+                "may_offer_semantic_sync": current_chat != source_chat and not declined,
+            },
             "sync_path": str(sync_path),
             "links_path": str(links_path),
             "context_path": str(context_path),
@@ -865,6 +957,33 @@ def cmd_restore(args: argparse.Namespace) -> None:
             "sync_text": read_safe_text(sync_path),
             "links_text": read_safe_text(links_path),
             "note": "Read context_path selectively only if the compact checkpoint is insufficient.",
+        }
+    )
+
+
+def cmd_title_sync(args: argparse.Namespace) -> None:
+    thread_id = get_thread_id(args.thread_id, required=True)
+    source_project, source_chat = canonical_names(args.project, args.chat)
+    if args.accept:
+        current_chat = app_server_set_thread_title(thread_id, source_chat)
+        set_title_sync_declined(thread_id, False)
+        action = "renamed"
+    else:
+        set_title_sync_declined(thread_id, True)
+        try:
+            current_chat = app_server_thread_title(thread_id)
+        except SyncError:
+            current_chat = None
+        action = "declined"
+    emit(
+        {
+            "ok": True,
+            "action": action,
+            "thread": thread_id,
+            "current_chat": current_chat,
+            "source_project": source_project,
+            "source_chat": source_chat,
+            "ask_again_in_this_chat": False if args.decline else None,
         }
     )
 
@@ -966,10 +1085,27 @@ def build_parser() -> argparse.ArgumentParser:
     restore.add_argument("--project")
     restore.add_argument("--chat")
     restore.add_argument("--current-project", required=True)
-    restore.add_argument("--current-chat", required=True)
+    restore.add_argument("--current-chat")
     restore.add_argument("--project-root")
+    restore.add_argument(
+        "--empty-chat",
+        action="store_true",
+        help="Rename a fresh restore-only chat to the canonical source chat title",
+    )
     restore.add_argument("--thread-id", help=argparse.SUPPRESS)
     restore.set_defaults(func=cmd_restore)
+
+    title_sync = subparsers.add_parser(
+        "title-sync",
+        help="Accept or permanently decline a restore title-alignment suggestion for this local chat",
+    )
+    title_sync.add_argument("--project", required=True, help="Canonical source project")
+    title_sync.add_argument("--chat", required=True, help="Canonical source chat title")
+    choice = title_sync.add_mutually_exclusive_group(required=True)
+    choice.add_argument("--accept", action="store_true")
+    choice.add_argument("--decline", action="store_true")
+    title_sync.add_argument("--thread-id", help=argparse.SUPPRESS)
+    title_sync.set_defaults(func=cmd_title_sync)
 
     link = subparsers.add_parser("link", help="Link the current thread as a computed source or restore-only consumer")
     link.add_argument("--project", required=True, help="Canonical source project")

@@ -2,7 +2,7 @@
 
 `codex-sync` moves the **working context** of a Codex chat between computers through a private GitHub repository. It saves what you are doing, what is already done, durable decisions, relevant external links, the next step, and optional small artifacts.
 
-It does **not** copy project source code, migrate Codex's internal session files, import an old thread, or assign an old thread ID to a new thread. On another computer you create a normal new Codex chat and restore the saved working context into it.
+It does **not** copy project source code, migrate Codex's internal session files, import an old thread, or assign an old thread ID to a new thread. On another computer you create a normal new Codex chat and restore the saved working context into it. A fresh restore-only chat is automatically given the source chat's exact user-facing title.
 
 ## What gets created
 
@@ -141,6 +141,10 @@ $codex-sync restore Supplier parser
 
 Restore pulls the latest state, reads `sync.md` and `links.md` first, and loads only relevant parts of `context.md` when needed. It does not push, mutate the saved state, resume an old Codex session, or change the current thread ID.
 
+When the current conversation was created only for restore and has no earlier substantive task, restore uses the documented Codex App Server `thread/name/set` method to rename it automatically to the exact canonical source title. A non-empty chat is never renamed without consent.
+
+If a non-empty chat has a semantically similar title, Codex offers title alignment once. Accepting renames the current chat. Refusing writes a local preference keyed by the current thread ID, outside both the project and State Repository, so that local chat is not asked again. An explicit later request can still align the title and clear the refusal.
+
 Saved chats are searched by exact match, normalized match, then semantic match. Codex proposes a short candidate list when the choice is genuinely ambiguous, instead of creating or restoring a near-duplicate blindly.
 
 ### Link adds explicit authorization
@@ -187,7 +191,7 @@ Without strict linking:
 
 1. On Windows, run `$codex-sync sync this chat` in project `aurora-platform`, chat `Supplier parser`.
 2. On the Mac, open the same logical project, create a new Codex chat, and run `$codex-sync restore Supplier parser`.
-3. The Mac chat receives the working context; its local Codex thread remains a new, unrelated internal session.
+3. The Mac chat receives the working context and the exact title `Supplier parser`; its local Codex thread remains a new, unrelated internal session.
 
 With strict linking:
 
@@ -223,6 +227,7 @@ python scripts/codex_sync.py doctor
 python scripts/codex_sync.py current-title
 python scripts/codex_sync.py bootstrap
 python scripts/codex_sync.py list
+python scripts/codex_sync.py title-sync --help
 ```
 
 Use `python scripts/codex_sync.py --help` for the deterministic command interface.

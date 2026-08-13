@@ -95,20 +95,30 @@ Let the CLI enforce authorization, scan for obvious secrets, commit only real ch
 ## Restore
 
 1. Run `list`, then select the canonical saved chat. If the current project contains `.codex-sync/linked-with.md`, allow the CLI to resolve the target by omitting `--project` and `--chat`.
-2. Call `restore` with the current project/chat names and project root. The CLI pulls current state and enforces strict linking.
+2. Decide whether this is a fresh restore-only chat. Treat it as fresh only when the conversation was created for this restore and contains no earlier substantive task. Do not infer freshness merely from a generic or generated title.
+3. Call `restore` with the current project/chat names and project root. Add `--empty-chat` for a fresh restore-only chat; the CLI must then rename the current Codex chat automatically to the exact canonical source chat through `thread/name/set`. `--current-chat` may be omitted only with `--empty-chat`.
 
 ```text
 python <skill>/scripts/codex_sync.py restore \
   [--project <canonical-project> --chat <canonical-chat>] \
   --current-project <current-project> --current-chat <current-chat> \
-  --project-root <current-project-root>
+  --project-root <current-project-root> [--empty-chat]
 ```
 
-3. Read the returned `sync_path` and `links_path` first. Reconstruct the immediate task and explain briefly what was restored.
-4. Read only relevant sections of `context_path` when `sync.md` is insufficient, an old decision matters, or ambiguity remains. Do not load it automatically in full.
-5. Use artifacts only when needed. Do not write or commit during restore.
+4. Read `title_alignment` in the result. If the current title differs, `may_offer_semantic_sync` is true, and the current title is semantically similar to the canonical source title, ask once whether to rename it to the exact source title. Do not offer merely because both chats are in the same project. Never rename a non-empty chat without consent.
+5. On acceptance, run `title-sync --accept`; on refusal, run `title-sync --decline` immediately. The decline is stored locally by current thread ID. If `suggestion_declined_locally` is true on any later restore in that chat, never ask again. A later explicit user request to align the title may still use `--accept`, which clears the refusal.
 
-Restore never imports, clones, resumes, or changes an internal Codex thread and never assigns an old thread ID.
+```text
+python <skill>/scripts/codex_sync.py title-sync \
+  --project <canonical-project> --chat <canonical-chat> \
+  (--accept | --decline)
+```
+
+6. Read the returned `sync_path` and `links_path` first. Reconstruct the immediate task and explain briefly what was restored.
+7. Read only relevant sections of `context_path` when `sync.md` is insufficient, an old decision matters, or ambiguity remains. Do not load it automatically in full.
+8. Use artifacts only when needed. Do not write or commit during restore.
+
+Restore never imports, clones, resumes, or assigns an old thread ID. It may change only the current thread's user-facing name under the rules above.
 
 ## Link
 
@@ -144,6 +154,7 @@ Read [state-format.md](references/state-format.md) when authoring or interpretin
 - Missing `CODEX_THREAD_ID`: disable linking and strict-mode access; preserve restore and allow open-mode sync only after explicit exact-title confirmation.
 - Missing or unverifiable current title: stop sync/link and ask the user to copy the exact visible title; never infer one.
 - App Server title differs from `--chat`/`--current-chat`: stop before bootstrap, file writes, commit, or push.
+- Fresh-chat rename failure: stop and report that automatic title alignment could not be completed; do not silently continue with a different title.
 - Non-portable exact title: ask the user to rename the chat instead of silently sanitizing it.
 - Consumer sync: refuse and explain that cross-project links are restore-only.
 - Unlinked strict restore/sync: refuse and direct the user to link first.
