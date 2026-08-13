@@ -141,7 +141,7 @@ $codex-sync restore Supplier parser
 
 Restore pulls the latest state, reads `sync.md` and `links.md` first, and loads only relevant parts of `context.md` when needed. It does not push, mutate the saved state, resume an old Codex session, or change the current thread ID.
 
-When the current conversation was created only for restore and has no earlier substantive task, restore uses the documented Codex App Server `thread/name/set` method to rename it automatically to the exact canonical source title. A non-empty chat is never renamed without consent.
+When the current conversation was created only for restore and has no earlier substantive task, restore renames it automatically to the exact canonical source title. In Codex App it prefers the native thread-title action so the open sidebar updates immediately. Other hosts fall back to the documented Codex App Server `thread/name/set` method. A non-empty chat is never renamed without consent.
 
 If a non-empty chat has a semantically similar title, Codex offers title alignment once. Accepting renames the current chat. Refusing writes a local preference keyed by the current thread ID, outside both the project and State Repository, so that local chat is not asked again. An explicit later request can still align the title and clear the refusal.
 

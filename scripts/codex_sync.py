@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Iterable, Sequence
 
 
-VERSION = "1.2.0"
+VERSION = "1.2.1"
 MAX_ARTIFACT_BYTES = 10 * 1024 * 1024
 INVALID_PATH_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 RESERVED_WINDOWS_NAMES = {

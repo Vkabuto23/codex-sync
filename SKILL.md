@@ -96,7 +96,7 @@ Let the CLI enforce authorization, scan for obvious secrets, commit only real ch
 
 1. Run `list`, then select the canonical saved chat. If the current project contains `.codex-sync/linked-with.md`, allow the CLI to resolve the target by omitting `--project` and `--chat`.
 2. Decide whether this is a fresh restore-only chat. Treat it as fresh only when the conversation was created for this restore and contains no earlier substantive task. Do not infer freshness merely from a generic or generated title.
-3. Call `restore` with the current project/chat names and project root. Add `--empty-chat` for a fresh restore-only chat; the CLI must then rename the current Codex chat automatically to the exact canonical source chat through `thread/name/set`. `--current-chat` may be omitted only with `--empty-chat`.
+3. For a fresh restore-only chat, rename it automatically to the exact canonical source title before presenting restored work. Prefer the host's native thread-title tool (for example `set_thread_title` in Codex App) so the open UI updates immediately. Then call `restore` normally with the new exact title. If no native title tool exists, add `--empty-chat`; the CLI uses App Server `thread/name/set` as a portable fallback. `--current-chat` may be omitted only with `--empty-chat`.
 
 ```text
 python <skill>/scripts/codex_sync.py restore \
@@ -106,7 +106,7 @@ python <skill>/scripts/codex_sync.py restore \
 ```
 
 4. Read `title_alignment` in the result. If the current title differs, `may_offer_semantic_sync` is true, and the current title is semantically similar to the canonical source title, ask once whether to rename it to the exact source title. Do not offer merely because both chats are in the same project. Never rename a non-empty chat without consent.
-5. On acceptance, run `title-sync --accept`; on refusal, run `title-sync --decline` immediately. The decline is stored locally by current thread ID. If `suggestion_declined_locally` is true on any later restore in that chat, never ask again. A later explicit user request to align the title may still use `--accept`, which clears the refusal.
+5. On acceptance, prefer the host's native thread-title tool to rename the open chat immediately, then run `title-sync --accept` to verify the persisted title and clear any refusal. If no native tool exists, `title-sync --accept` performs the rename through App Server. On refusal, run `title-sync --decline` immediately. The decline is stored locally by current thread ID. If `suggestion_declined_locally` is true on any later restore in that chat, never ask again. A later explicit user request to align the title may still use `--accept`, which clears the refusal.
 
 ```text
 python <skill>/scripts/codex_sync.py title-sync \
@@ -155,6 +155,7 @@ Read [state-format.md](references/state-format.md) when authoring or interpretin
 - Missing or unverifiable current title: stop sync/link and ask the user to copy the exact visible title; never infer one.
 - App Server title differs from `--chat`/`--current-chat`: stop before bootstrap, file writes, commit, or push.
 - Fresh-chat rename failure: stop and report that automatic title alignment could not be completed; do not silently continue with a different title.
+- UI title remains stale after CLI fallback: verify the persisted title, use the host's native title tool when available, and report the refresh limitation instead of claiming the visible UI changed.
 - Non-portable exact title: ask the user to rename the chat instead of silently sanitizing it.
 - Consumer sync: refuse and explain that cross-project links are restore-only.
 - Unlinked strict restore/sync: refuse and direct the user to link first.
