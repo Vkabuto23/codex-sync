@@ -1,0 +1,4 @@
+interface:
+  display_name: "Codex Sync"
+  short_description: "Sync Codex work context across computers"
+  default_prompt: "Use $codex-sync to save, restore, or link this Codex work context."
