@@ -41,6 +41,8 @@ python <skill>/scripts/codex_sync.py bootstrap
 
 The CLI requires `git` and an authenticated GitHub CLI session. It obtains the GitHub login from `gh api user --jq .login`, creates `{login}-codex-sync` as a private repository when missing, verifies that an existing repository is private, and maintains a stable local clone.
 
+Treat GitHub access as sandbox-sensitive. When the host already declares network or OS credential-store access restricted, run `doctor`, `bootstrap`, and every GitHub-dependent codex-sync command with the host's approved system/escalated access from the outset. Otherwise try normally once; if the CLI reports network, sandbox, permission, or credential-store isolation, repeat the exact command through the approval flow. Do not ask the user to run `gh auth login` until the approved retry also reports a real authentication failure such as HTTP 401 or bad credentials. Never try to bypass the approval flow or read token values.
+
 Stop on missing dependencies, failed authentication, a public state repository, a dirty state clone, non-fast-forward conflicts, or secret-scan failures. Never force-push.
 
 ## Determine project, exact chat title, and thread
@@ -150,7 +152,8 @@ Read [state-format.md](references/state-format.md) when authoring or interpretin
 ## Handle failures
 
 - Missing `gh`: stop and ask the user to install GitHub CLI.
-- Unauthenticated `gh`: stop and ask the user to run `gh auth login`.
+- Sandbox/network/credential-store isolation: retry the same command with approved system/escalated access; do not misdiagnose it as logout.
+- Unauthenticated `gh` confirmed after an approved retry: stop and ask the user to run `gh auth login`.
 - Missing `CODEX_THREAD_ID`: disable linking and strict-mode access; preserve restore and allow open-mode sync only after explicit exact-title confirmation.
 - Missing or unverifiable current title: stop sync/link and ask the user to copy the exact visible title; never infer one.
 - App Server title differs from `--chat`/`--current-chat`: stop before bootstrap, file writes, commit, or push.

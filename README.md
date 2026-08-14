@@ -32,6 +32,12 @@ projects/
 - `linked-chats.md` — optional allowed local thread IDs and their `source` or `consumer` role.
 - `artifacts/` — only small files genuinely required on the other computer.
 
+## Codex sandbox and GitHub authentication
+
+Codex commands inherit the host sandbox, which may block `api.github.com` or access to the OS credential store even when GitHub CLI is already authenticated. `codex-sync` distinguishes these isolation failures from genuine authentication errors. In a restricted Codex environment, rerun GitHub-dependent commands through the normal approval flow with system/network access; do not reauthenticate unless the approved retry also returns HTTP 401 or bad credentials.
+
+The skill never reads or prints the GitHub token. It verifies the account with `gh api user --jq .login` only.
+
 ## Requirements
 
 - Codex with local skills support

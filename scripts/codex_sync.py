@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Iterable, Sequence
 
 
-VERSION = "1.2.1"
+VERSION = "1.2.2"
 MAX_ARTIFACT_BYTES = 10 * 1024 * 1024
 INVALID_PATH_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 RESERVED_WINDOWS_NAMES = {
@@ -130,10 +130,37 @@ def require_program(name: str, install_hint: str) -> str:
 
 def github_username() -> str:
     require_program("gh", "Install GitHub CLI from https://cli.github.com/ and run 'gh auth login'.")
-    status = run(["gh", "auth", "status"], check=False)
-    if status.returncode:
-        raise SyncError("GitHub CLI is not authenticated. Run 'gh auth login', then retry.")
-    result = run(["gh", "api", "user", "--jq", ".login"])
+    result = run(["gh", "api", "user", "--jq", ".login"], check=False)
+    if result.returncode:
+        detail = redact(f"{result.stdout}\n{result.stderr}".strip())
+        lowered = detail.casefold()
+        network_markers = (
+            "error connecting",
+            "check your internet connection",
+            "could not resolve host",
+            "network is unreachable",
+            "connection refused",
+            "operation not permitted",
+            "permission denied",
+            "failed to connect",
+        )
+        if any(marker in lowered for marker in network_markers):
+            raise SyncError(
+                "GitHub access check was blocked by the network, sandbox, or credential-store isolation. "
+                "In Codex, retry the same codex-sync command with approved system/escalated access. "
+                "Do not run 'gh auth login' unless that approved retry also reports an authentication failure."
+            )
+        auth_markers = (
+            "http 401",
+            "bad credentials",
+            "authentication required",
+            "not logged into",
+            "not authenticated",
+            "token is invalid",
+        )
+        if any(marker in lowered for marker in auth_markers):
+            raise SyncError("GitHub CLI is not authenticated. Run 'gh auth login', then retry.")
+        raise SyncError(f"GitHub CLI could not verify the current account: {detail[:500] or 'unknown error'}")
     username = result.stdout.strip()
     if not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})", username):
         raise SyncError("GitHub CLI returned an invalid account login.")
